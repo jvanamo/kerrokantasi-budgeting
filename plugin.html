@@ -1,0 +1,678 @@
+<!DOCTYPE html>
+<html>
+<head>
+
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=0" />
+
+	<script src="//cdnjs.cloudflare.com/ajax/libs/jquery/2.1.4/jquery.min.js"></script>
+	<script src="//maxcdn.bootstrapcdn.com/bootstrap/3.3.5/js/bootstrap.min.js"></script>
+	<script src="//cdn.leafletjs.com/leaflet/v0.7.7/leaflet.js"></script>
+
+	<link href="//fonts.googleapis.com/css?family=Lato:400,700,300" rel="stylesheet" />
+	<link href="//maxcdn.bootstrapcdn.com/bootstrap/3.3.5/css/bootstrap.min.css" rel="stylesheet" />
+	<link href="//cdn.leafletjs.com/leaflet/v0.7.7/leaflet.css" rel="stylesheet" />
+
+	<script src="js/vendor/jquery.mmenu.all.min.js"></script>
+	<script src="js/vendor/handlebars-3.0.3.js"></script>
+	<script src="js/vendor/proj4.js"></script>
+	<script src="js/vendor/proj4leaflet.js"></script>
+	<script src="js/vendor/leaflet.pip-1.0.0.min.js"></script>
+	<script src="js/vendor/leaflet.snogylop.js"></script>
+	
+	<link href="css/vendor/jquery.mmenu.all.css" rel="stylesheet" />
+	<link href="css/map.css" rel="stylesheet" />
+
+</head>
+
+<body>
+
+<div class="map-container">
+	<div class="map-canvas" id="map-canvas"></div>
+	<div class="map-controls" id="map-controls"></div>	
+	<div class="map-outputs" id="map-outputs">
+		<div class="map-output">Jäljellä <span data-output="remaining-total">0</span> €</div>
+	</div>
+</div>
+
+<script>
+
+L.icon = function (options) {
+    return new L.Icon(options);
+};
+
+SymbolIcon = L.Icon.extend({
+    options: {
+        iconUrl: 'mapmarkers/marker-default-1.svg',
+        iconSize:     [26, 32],
+        iconAnchor:   [13, 32],
+        popupAnchor:  [0, -14]
+    }
+});
+
+// adapted from Helsinki service map (palvelukartta.hel.fi) to use the city's custom map tiles from geoserver.hel.fi
+function makeLayer() {
+	var bounds, crsName, crsOpts, originNw, projDef;
+	crsName = 'EPSG:3067';
+	projDef = '+proj=utm +zone=35 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs';
+	bounds = L.bounds(L.point(-548576, 6291456), L.point(1548576, 8388608));
+	originNw = [bounds.min.x, bounds.max.y];
+	crsOpts = {
+		resolutions: [8192, 4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1, 0.5, 0.25, 0.125],
+		bounds: bounds,
+		transformation: new L.Transformation(1, -originNw[0], -1, originNw[1])
+	};
+	return new L.Proj.CRS(crsName, projDef, crsOpts);
+}
+
+function showModal(data) {
+	var template = Handlebars.compile($("#template-bootstrap-modal").html()),
+		modal = template({ title: data.title, content: data.content });
+	$(modal)
+		.modal()
+		.on('hidden.bs.modal', function () {
+			$(this).remove();
+		});	
+}
+
+// init world
+var tm35 = makeLayer(),
+	worldSouthWest = tm35.projection.unproject(tm35.options.bounds.min),
+	worldNorthEast = tm35.projection.unproject(tm35.options.bounds.max);
+	worldLatLngs = [L.latLng(worldNorthEast.lat, worldNorthEast.lng), L.latLng(worldNorthEast.lat, worldSouthWest.lng), L.latLng(worldSouthWest.lat, worldNorthEast.lng), L.latLng(worldSouthWest.lat, worldSouthWest.lng)];
+	worldOrigo = L.latLng((worldNorthEast.lat - worldSouthWest.lat) / 2, (worldNorthEast.lng - worldSouthWest.lng) / 2);
+
+var helsinki = [60.1708, 24.9375];
+
+// init leaflet base map
+var canvas = L.map('map-canvas', {
+	crs : tm35
+}).setView(helsinki, 9);
+
+// init Helsinki WTMS
+var tilelayer = L.tileLayer('http://geoserver.hel.fi/mapproxy/wmts/osm-sm/etrs_tm35fin/{z}/{x}/{y}.png', {
+	maxZoom: 15,
+	minZoom: 9,
+	continuousWorld: true
+}).addTo(canvas);
+
+canvas.init = function(postmessage) {
+	
+	var me = this;
+	
+	var mapdata = (typeof postmessage.data === 'string') ? JSON.parse(postmessage.data) : postmessage.data;
+	
+	var boundary = mapdata.boundary || null,
+		existing = mapdata.existing || null,
+		catalog = mapdata.catalog || [],
+		limit = mapdata.limit || 0;
+	
+	me.instanceId = postmessage.instanceId || null;
+	me.mapdata = mapdata;
+	me.userdata = {};
+	me.limit = limit;
+	me.features = L.featureGroup();
+	me.catalog = catalog;
+
+	// if geojson boundaries passed, draw an inverted polygon on map to mask out other (non-allowed) areas
+	if (boundary && boundary.hasOwnProperty('features')) {
+		
+		// remove existing boundaries upon reinitialization
+		if (me.hasOwnProperty('boundary')) {
+			me.removeLayer(me.boundary);
+		}
+	
+		me.boundary = L.geoJson(boundary, {
+			className	: 'leaflet-click-allowed',
+			clickable	: true,
+			color		: '#000',
+			fill		: '#000',
+			fillOpacity	: 0.25,
+			invert		: true,
+			opacity		: 0.25,
+			weight		: 1,
+			worldLatLngs: worldLatLngs
+		}).addTo(me);
+		
+		me.boundary.on('click', function(e) {
+			me.setActive();
+		});
+
+		me.features.addLayer(me.boundary);
+		
+	};
+	
+	// if geojson features passed, draw them on map
+	if (existing && existing.hasOwnProperty('features')) {
+	
+		// remove existing boundaries upon reinitialization
+		if (me.hasOwnProperty('existing')) {
+			me.removeLayer(me.existing);
+		}
+	
+		me.existing = L.geoJson(existing, {	
+			onEachFeature: function (feature, layer) {
+				layer.on('click', function(e) {
+					var id = e.target._leaflet_id;
+					if (me.userdata.hasOwnProperty(id)) {
+						var entry = me.userData[id];
+					} else {
+						// temp hard coded hack, content, id and title should be passed as parameters and used directly from data.existing
+						var content = feature.properties.alatyyppi + ', ' + feature.properties.materiaali + ' (lähde: HKR/Yleisten alueiden rekisteri)',
+							latlng = e.target._latlng,
+							osan_id = feature.properties.osan_id,
+							title = 'Kommentoi nykyistä';
+						var entry = me.addEntry({
+							id 			: id,
+							latlng		: latlng,
+							draggable	: false,
+							properties	: {
+								content : content,
+								osan_id : osan_id,
+								title : title,
+							}
+						});
+					}
+					me.setActive(entry.id);				
+				});
+			},
+			pointToLayer: function(feature, latlng) {
+				return new L.CircleMarker(latlng, {
+					fillOpacity	: .75,
+					radius		: 6, 
+					stroke		: 0
+				});	
+			},
+			style: function(feature) {
+				// temp hard coded hack, color should be passed as a parameter and used directly from data.existing
+				// alatyyppi_ = 383 -> trash -> gray
+				// alatyyppi_ = something else -> chairs, tables etc -> lila
+				var color = feature.properties.alatyyppi_ == 383 ? '#636363' : '#756bb1';
+				return { color: color };			
+			}
+		});
+		
+		me.features.addLayer(me.existing);
+
+	}
+	
+	// if boundaries or existing features were passed, fit view to them
+	// set max bounds of the map slightly larger than the objects' bounds
+	if (me.features.getLayers().length > 0) {
+		var maxBounds = me.features.getBounds();
+		canvas.fitBounds(maxBounds);
+		var	maxNorth = maxBounds.getNorth() + 0.05,
+			maxEast = maxBounds.getEast() + 0.1,
+			maxSouth = maxBounds.getSouth() - 0.05,
+			maxWest = maxBounds.getWest() - 0.1,
+			maxBounds = [[maxSouth, maxWest], [maxNorth, maxEast]];
+		canvas.setMaxBounds(maxBounds);
+	}
+
+}
+
+canvas.clickCanvas = function(e) {
+	var me = this;
+	if (me.dragBlock) {
+		// drag block is set to true when user starts dragging any marker
+		// this is done to prevent the canvas click event, fired after the marker dragend event, from opening an unwanted popup
+		me.dragBlock = null;
+	} else if (me.getActive()) {
+		// there's a popup open somewhere, do not add a new entry before it is closed
+		me.setActive();
+	} else if (me.userdata) {
+		// all clear, add a new entry
+		var entry = me.addEntry({ latlng : e.latlng, properties : { title : 'Ehdota uutta' } });
+		// open newly created entry
+		me.setActive(entry.id);
+	}
+}
+	
+canvas.addEntry = function(properties) {
+	
+	var me = this,
+		userdata = me.userdata;
+
+	if (properties.hasOwnProperty('id') && userdata.hasOwnProperty(properties.id)) {
+		
+		return userdata[properties.id];
+		
+	} else {
+
+		var latlng = properties.latlng,
+			draggable = (properties.hasOwnProperty('draggable')) ? properties.draggable : true,
+			marker = properties.marker || L.marker(latlng, { draggable : draggable, icon : new SymbolIcon() }),
+			popup = properties.popup || L.popup({ autoPanPadding : L.point(5,20), className: 'leaflet-popup-mmenu', closeButton : false, maxHeight: 320 }),
+			template = Handlebars.compile($("#template-leaflet-popup").html()),
+			html = properties.html || template({ catalog : me.catalog, properties : properties.properties });
+		
+		marker
+			.addTo(me)
+			.setLatLng(latlng)
+			.bindPopup(popup);
+
+		popup
+			.setContent(html)
+			.setLatLng(latlng);
+
+		// we are assuming that leaflet handles the uniqueness of ids
+		var id = properties.id || marker._leaflet_id;
+
+		var entry = properties;
+		
+		entry.id = id;
+		entry.marker = marker;
+		entry.popup = popup;
+		
+		// dragblock is required to catch and prevent the extra click event fired afted dragend
+		marker.on('dragstart', function(f) {					  
+			me.dragBlock = true;
+		});
+		
+		// check whether drag event's latlng hits any boundaries
+		marker.on('drag', function(f) {
+			var ll = f.target.getLatLng(),
+				clashed = leafletPip.pointInLayer(ll, me.boundary, true);				
+			if (clashed.length > 0) {
+				// marker is above a non-allowed polygon, move back to previous position
+				marker.setLatLng(entry.latlng);
+			} else {
+				// all clear, store current position 
+				entry.latlng = ll;
+			}
+			
+		});
+		
+		// update after drag to store new coordinates
+		marker.on('dragend', function() {
+			me.update();
+		});
+		
+		// disable default click behavior
+		marker.off('click');
+		
+		// define custom click events
+		marker.on('click', function(f) {
+			if (me.dragBlock) {
+				// dragblock prevents popup from showing after dragend
+				// dragend fires an additional click event in the element that is under the cursor
+				// the first click event is captured here to switch off the dragblock
+				me.dragBlock = null;
+			} else {
+				// no dragblocks ahead, open popup upon click
+				me.setActive(id);
+			}
+		});
+		
+		userdata[id] = entry;
+		
+		return entry;
+		
+	}
+	
+}
+	
+canvas.removeEntry = function(id) {
+	var me = this,
+		userdata = me.userdata
+		entry = userdata[id] || false;
+	if (entry) {
+		var marker = entry.marker;
+		me.removeLayer(marker);
+		delete userdata[id];
+	}
+}
+	
+canvas.setActive = function(id) {
+	var me = this,
+		userdata = me.userdata,
+		active = me.getActive();
+	// deactivate the current entry first
+	if (active) {	
+		var popup = active.popup,
+			marker = active.marker,
+			type = active.type,
+			latlng = active.latlng || false,
+			value = active.value || false,
+			key = active.key || false;
+		// check if user is closing a popup that has no option selected
+		if (latlng && ((value && key == 'comment') || (value != false && key != 'comment'))) {
+			// user has selected an option or added a comment
+			// do nothing at the moment
+		} else {
+			// user is closing a popup without a selection, delete all
+			me.removeEntry(active.id);
+		}	
+	}
+	var entry = userdata[id] || false;
+	if (entry) {
+		var popup = entry.popup,
+			marker = entry.marker,
+			type = entry.type;
+		popup.openOn(me);
+		me.initMMenu(entry);
+		me.active = entry;
+	} else {
+		me.closePopup();
+		me.active = null;
+	}
+	me.update();
+}
+	
+canvas.getActive = function() {
+	var me = this,
+		active = me.active || null;
+	return active;
+}
+	
+canvas.initMMenu = function(entry) {
+	
+	var me = this;
+
+	// locate .mmenu element 
+	var $mmenu = $('.leaflet-popup-content > .mmenu');
+
+	// init mmenu inside leaflet popup
+	$mmenu.mmenu({
+		autoHeight: true,
+		navbars	: [
+			{ 
+				position : 'top', 
+				content : [ "prev", "title", "next" ]
+			},
+			{ 
+				position : 'bottom',
+				content : '<a href="#" class="text-danger" data-action="marker-remove">Poista</a> <a href="#" class="text-success" data-action="marker-ready">Valmis</a>'
+			}
+		],
+		offCanvas: false
+	});
+	
+	// subscribe to current mmenu element's API for some UI tweaks and extra smoothness
+	var	api = $mmenu.data("mmenu"),
+		key = entry.key,
+		value = entry.value || '';
+		
+	var $comment = $mmenu.find('#input-comment').first(),
+		$footer = $mmenu.find('.mm-navbar-bottom');
+	
+	api
+		.bind("openPanel", function($element) {
+			var pid = $element.attr('id');
+			if (pid == 'mm-panel-comment') {
+				// if we are on comment panel, wait until slidein animation has elapsed to set focus to textarea
+				setTimeout(function() { $comment.focus(); }, 400);
+			}
+		})
+		.bind("setSelected", function($element) {				
+			var $panels = $element.closest('.mm-panels'),
+				stack = [$element];
+			// remove selected-class from all list items
+			$panels.find('li').removeClass('mm-selected-parent');
+			// recursively add selected-class to list items that are panel's ancestors
+			while(stack.length > 0) {
+				var target = stack.shift().closest('.mm-panel').attr('id'),
+					$elements = $panels.find('.mm-listview [data-target="#' + target + '"]');
+				if ($elements.length > 0) {
+					$listitem = $elements.first().closest('li').addClass('mm-selected-parent');	
+					stack.push($listitem);
+				}
+			}
+			me.update();
+		});
+	
+	if (key) {
+		// we are re-opening an existing marker, populate existing selection/comment 
+		if (key == 'comment') {
+			var $panel = $('#mm-panel-comment');
+			$comment.html(value);
+		} else {
+			var $listitem = $mmenu.find('[data-action="option-select"][data-key="' + key + '"]').closest('li'),
+				$panel = $listitem.closest('.mm-panel');
+			api.setSelected($listitem);
+		}
+		api.openPanel($panel);
+	} else {
+		// we just added a new entry without any selections, disable footer buttons
+		$footer.addClass('disabled');	
+	}
+
+	// init remaining mmenu interactions
+	$mmenu
+		.on( 'click', '[data-action="option-select"][href]', function() {
+			var $clicked = $(this),
+				icon = new SymbolIcon({ iconUrl : $clicked.data('marker') });
+			entry.marker.setIcon(icon);
+			entry.key = $clicked.data('key');
+			entry.value	= $clicked.data('value');
+			entry.cost = $clicked.data('cost');
+			$footer.removeClass('disabled');
+			return true;
+		})
+		.on( 'click', '[data-action="option-expand"]', function() {
+			var target = $(this).parent().find('a[data-target]').data('target');
+			api.openPanel($(target));
+			return false;
+		})
+		.on( 'click', '[data-action="modal-show"]', function() {
+			var $clicked = $(this),
+				content = $clicked.data('content') || '<br />',
+				title = $clicked.data('title') || '&nbsp;';
+			showModal({ title: title, content: content });
+			return false;
+		})
+		.on( 'click', '[data-action="marker-close"], [data-action="marker-ready"]', function(e) {
+			e.preventDefault();
+			me.setActive();
+		})
+		.on( 'click', '[data-action="marker-remove"]', function(e) {
+			e.preventDefault();
+			me.removeEntry(entry.id);
+			me.setActive();
+		});
+
+	$comment.on('keyup', function() {
+		var v = $(this).val() || false;
+		var	icon = new SymbolIcon();
+		$footer.toggleClass('disabled', !v);
+		entry.marker.setIcon(icon);
+		entry.key = 'comment';
+		entry.value = v;
+		delete entry.cost;
+		me.update();
+	});
+
+}
+	
+canvas.update = function() {
+	var me = this,
+		cost = 0,
+		instanceId = me.instanceId,
+		limit = me.limit,
+		userdata = me.userdata;
+	
+	$.each(userdata, function(i, d) {
+		cost += d.cost || 0;
+	});
+	
+	var remaining = Math.max(0, limit - cost);
+	
+	$('[data-output="remaining-total"]').html(remaining);
+	
+	var $links = $('.mm-listview').find('a[data-cost]'),
+		activeCost = $('.mm-listview').find('li.mm-selected > a[data-cost]').data('cost') || 0;
+		
+	$.each($links, function(i, l) {
+		
+		var $link = $(l),
+			$listitem = $link.parent('li');
+			
+		if ($link.data('cost') > remaining + activeCost) {
+			
+			$listitem.addClass('mm-disabled');
+			$link.removeAttr('href');
+			
+		} else {
+			
+			$listitem.removeClass('mm-disabled');
+			$link.attr('href', '#');
+			
+		}
+		
+	});
+	
+	window.parent.postMessage({ message: 'userDataChanged', instanceId: instanceId }, '*');
+}
+	
+canvas.serialize = function(postmessage) {
+		
+	var me = this,
+		instanceId = me.instanceId,
+		userdata = me.userdata,
+		data = [];
+	
+	if (userdata) {
+	
+		$.each(userdata, function(i, d) {
+			var latlng = d.latlng,
+				entry = {
+					key: d.key,
+					value: d.value,
+				}
+			if (latlng.lat && latlng.lng) {
+				entry.lat = latlng.lat;
+				entry.lng = latlng.lng;
+			}
+			if (d.cost) {
+				entry.cost = d.cost;	
+			}
+			if (d.properties && d.properties.hasOwnProperty('osan_id')) {
+				// temp hack, include Yleisten Alueiden Rekisteri's ID to link comments to existing features
+				entry.osan_id = d.properties.osan_id;
+			}
+			data.push(entry);
+		});
+	
+	}
+	
+	//console.log(data);
+	window.parent.postMessage({ message: 'userData', data: JSON.stringify(data), instanceId: instanceId }, '*');
+
+}
+	
+// hide/show existing features based on zoom level
+canvas.on('zoomend', function() {
+	var me = this;
+	var visible = this.getZoom() > 12,
+		existing = me.existing || false;
+	if (visible && existing) {
+		me.addLayer(existing);
+	} else {
+		me.removeLayer(existing);
+	}
+});
+	
+canvas.on('click', function (e) {
+	var me = this;
+	me.clickCanvas(e);
+});
+
+$(document).keyup(function(e) {						   
+	var modalOpen = $('body').hasClass('modal-open');
+	if (e.keyCode == 27 && !modalOpen) {
+		canvas.setActive();
+		canvas.update();
+	}
+});
+
+window.addEventListener('message', function(postmessage) {		
+	if (postmessage.data.message == 'mapData' && postmessage.data.instanceId) {
+		canvas.init(postmessage.data);	
+	}
+	if (postmessage.data.message == 'getUserData' && postmessage.data.instanceId) {
+		canvas.serialize(postmessage.data);	
+	}
+});
+
+</script>
+
+<!-- generic bootstrap modal for displaying additional information about catalog items -->
+<script id="template-bootstrap-modal" type="text/x-handlebars-template">
+	<div class="modal fade" id="generic-modal" tabindex="-1" role="dialog" aria-hidden="true" aria-labelledby="generic-modal-label">
+		<div class="modal-dialog">
+			<div class="modal-content">
+				<div class="modal-header">
+					<button type="button" class="close" data-dismiss="modal" aria-label="Sulje"><span aria-hidden="true">&times;</span></button>
+					<h4 class="modal-title" id="generic-modal-label">{{title}}</h4>
+				</div>
+				<div class="modal-body">
+					{{{content}}}
+				</div>
+			</div>
+		</div>
+	</div>
+</script>
+
+<!-- generic leaflet popup window for storing the mmenu options -->
+<script id="template-leaflet-popup" type="text/x-handlebars-template">
+	<nav class="mmenu">
+		<div id="mm-panel-main" class="Panel">
+			{{#if properties.content}}
+				<p>{{properties.content}}</p>
+			{{/if}}
+			<ul>
+				{{#unless properties.content}}
+					{{#each catalog}}
+						<li>
+							<a href="#" data-action="option-expand" data-key="option-{{@index}}">{{title}}</a>
+							{{#if options}}
+								<ul>
+									{{#each options}}
+									<li>
+										<a href="#" data-action="option-select" data-key="option-{{@../index}}-{{@index}}" data-value="{{title}}" data-cost="{{cost}}" data-marker="{{marker}}" >
+											<div class="option-select-image" data-action="modal-show" data-title="{{title}}" data-content='<p><img src="{{image}}" class="img-responsive" /></p><p>{{description}}</p>'>
+												<img src="{{thumbnail}}" width="30" height="30" class="img-circle">
+												<div class="option-select-image-hover"><span class="glyphicon glyphicon-search"></span></div>
+											</div>
+											<div class="option-select-meta">{{cost}} €</div>
+											<div class="option-select-label">{{title}}</div>
+										</a>
+									</li>
+									{{/each}}
+								</ul>
+							{{/if}}
+						</li>
+					{{/each}}
+				{{/unless}}
+				<li>
+					<a href="#mm-panel-comment">Lisää kommentti</a>
+				</li>
+			</ul>
+			<div class="Hidden hide">
+				<span class="Title">
+					{{#if properties.title}}
+						{{properties.title}}
+					{{/if}}
+					{{#unless properties.title}}
+						Merkitse kartalle
+					{{/unless}}
+				</span>
+			</div>
+		</div>
+		<div id="mm-panel-comment" class="Panel">
+			<form class="mm-form">
+				<textarea class="form-control mm-textarea" placeholder="Kirjoita kommenttisi tähän" id="input-comment"></textarea>
+			</form>
+			<div class="Hidden hide">
+				<a class="Prev" href="#mm-panel-main"></a>
+				<a class="Title" href="#mm-panel-main">Lisää kommentti</a>
+			</div>
+		</div>
+		<a class="mm-close" href="#" data-action="marker-close"></a>
+	</nav>
+</script>
+
+</body>
+
+</html>
+
